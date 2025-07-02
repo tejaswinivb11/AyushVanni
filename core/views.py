@@ -52,12 +52,36 @@ import joblib, numpy as np
 from datetime import timedelta
 from django.db.models import Avg
 
+from geopy.distance import geodesic
+from datetime import timedelta
+import joblib
+import numpy as np
+from django.db.models import Avg
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.views import APIView
+from django.db.models import Sum
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from datetime import timedelta
+from django.db.models import Avg, Sum
+from geopy.distance import geodesic
+import numpy as np
+import joblib
+
+from .models import DiseaseCase, DiseaseResourceRequirement, Inventory, Hospital, Outbreak
+from .serializers import DiseaseCaseSerializer
+
 class DiseaseCaseCreateView(APIView):
     def post(self, request, *args, **kwargs):
         try:
-            clf = joblib.load(r"I:\AuyshVanniVVCE\ayush\core\outbreak_global_model.pkl")  # load once
+            # Load ML model
+            clf = joblib.load(r"I:\mini project\ayush\core\outbreak_global_model.pkl")
             data = request.data
-            # Try to update same date record
+
+            # Check if case already exists
             existing = DiseaseCase.objects.filter(
                 hospital_id=data.get('hospital'),
                 disease_id=data.get('disease'),
@@ -76,18 +100,84 @@ class DiseaseCaseCreateView(APIView):
                     return Response({'response': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
                 case = serializer.save()
 
-            # 7-day avg
+            # Compute 7-day average
             week_ago = case.date_reported - timedelta(days=7)
-            avg = (DiseaseCase.objects
-                   .filter(hospital=case.hospital,
-                           disease=case.disease,
-                           date_reported__gt=week_ago,
-                           date_reported__lt=case.date_reported)
-                   .aggregate(avg=Avg('daily_cases'))['avg'] or 0.0)
+            avg = DiseaseCase.objects.filter(
+                hospital=case.hospital,
+                disease=case.disease,
+                date_reported__gt=week_ago,
+                date_reported__lt=case.date_reported
+            ).aggregate(avg=Avg('daily_cases'))['avg'] or 0.0
             case.avg_7day_cases = avg
             case.save()
 
-            features = np.array([[ 
+            # Step 1: Total cases of that disease in the hospital
+            total_cases = DiseaseCase.objects.filter(
+                hospital=case.hospital,
+                disease=case.disease
+            ).aggregate(total=Sum('daily_cases'))['total'] or 0
+
+            # Step 2: Get required resources
+            requirements = DiseaseResourceRequirement.objects.filter(disease=case.disease)
+            if not requirements.exists():
+                return Response({
+                    'response': 'No resource requirements mapped for this disease. Please update DiseaseResourceRequirement.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            insufficient_resources = []
+            suggestions = []
+
+            for req in requirements:
+                total_needed = req.quantity_per_patient * total_cases
+
+                # Check inventory for this product
+                inventory = Inventory.objects.filter(hospital=case.hospital, product=req.product).first()
+                available = inventory.quantity if inventory else 0
+
+                if available < total_needed:
+                    insufficient_resources.append({
+                        'product': req.product.name,
+                        'required': total_needed,
+                        'available': available
+                    })
+
+                    # Find suggestions from nearby hospitals
+                    nearby = []
+                    requester = case.hospital
+                    for hospital in Hospital.objects.exclude(id=requester.id):
+                        inv = Inventory.objects.filter(hospital=hospital, product=req.product).first()
+                        if inv and inv.quantity > inv.threshold:
+                            dist = geodesic(
+                                (requester.latitude, requester.longitude),
+                                (hospital.latitude, hospital.longitude)
+                            ).km
+                            nearby.append({
+                                'hospital_id': hospital.id,
+                                'hospital_name': hospital.name,
+                                'available_quantity': inv.quantity,
+                                'product': req.product.name,
+                                'distance_km': round(dist, 2)
+                            })
+
+                    if nearby:
+                        nearby.sort(key=lambda x: x['distance_km'])
+                        suggestions.append({
+                            'resource': req.product.name,
+                            'required': total_needed,
+                            'available': available,
+                            'suggested_hospitals': nearby[:3]
+                        })
+
+            # Step 3: If shortages, return early before outbreak prediction
+            if insufficient_resources:
+                return Response({
+                    'response': 'Insufficient resources!',
+                    'shortages': insufficient_resources,
+                    'suggestions': suggestions
+                }, status=status.HTTP_200_OK)
+
+            # Step 4: Predict outbreak (only if resources are sufficient)
+            features = np.array([[
                 case.hospital.id,
                 case.disease.id,
                 case.daily_cases,
@@ -97,22 +187,28 @@ class DiseaseCaseCreateView(APIView):
             pred = clf.predict(features)[0]
 
             if pred == 1:
-                ob, created = Outbreak.objects.get_or_create(
+                outbreak, created = Outbreak.objects.get_or_create(
                     hospital=case.hospital,
                     disease=case.disease,
                     status='active',
                     defaults={'start_date': case.date_reported}
                 )
-                if not created and ob.status != 'active':
-                    ob.start_date = case.date_reported
-                    ob.status = 'active'
-                ob.save()
-                return Response({'response': 'Outbreak detected!'}, status=status.HTTP_200_OK)
+                if not created and outbreak.status != 'active':
+                    outbreak.start_date = case.date_reported
+                    outbreak.status = 'active'
+                outbreak.save()
+                return Response({'response': 'Resources are sufficient. Outbreak detected!'}, status=200)
 
-            return Response({'response': 'No outbreak detected'}, status=status.HTTP_200_OK)
+            return Response({'response': 'Resources are sufficient. No outbreak detected.'}, status=200)
+
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    
+from rest_framework.views import APIView
+
+
+from core.models import Inventory, InventoryNotification
 
 from geopy.distance import geodesic
 
@@ -285,3 +381,31 @@ class ProductListView(APIView):
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         
         return Response({'error': 'Product name is required'}, status=status.HTTP_400_BAD_REQUEST)
+    
+
+    # views.py
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from core.models import Disease, Product, DiseaseResourceRequirement
+
+class DiseaseResourceView(APIView):
+    def post(self, request):
+        disease_name = request.data.get("disease")
+        resources = request.data.get("resources", {})
+
+        if not disease_name or not isinstance(resources, dict):
+            return Response({"error": "Invalid data."}, status=status.HTTP_400_BAD_REQUEST)
+
+        disease, _ = Disease.objects.get_or_create(name=disease_name)
+
+        for product_name, qty in resources.items():
+            product, _ = Product.objects.get_or_create(name=product_name)
+            DiseaseResourceRequirement.objects.update_or_create(
+                disease=disease,
+                product=product,
+                defaults={"quantity_per_patient": qty}
+            )
+
+        return Response({"message": f"Resources mapped to disease '{disease_name}'."})

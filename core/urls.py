@@ -10,4 +10,5 @@ urlpatterns = [
     path('inventory/remove/', views.RemoveInventoryView.as_view(), name='inventory-remove'),
     path('inventory/suggestions/', views.InventorySuggestionView.as_view(), name='inventory-suggestions'),
     path('products/', views.ProductListView.as_view(), name='product-list'),
+    path('disease-resources/', views.DiseaseResourceView.as_view(), name='disease-resources'),
 ]

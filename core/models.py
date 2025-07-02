@@ -102,3 +102,15 @@ class MLForecast(models.Model):
 
     def __str__(self):
         return f"Forecast for {self.product.name} at {self.hospital.name} on {self.forecast_date}"
+
+
+# --------------------------
+# 5. DiseaseResourceRequirement
+# --------------------------
+class DiseaseResourceRequirement(models.Model):
+    disease = models.ForeignKey(Disease, on_delete=models.CASCADE)
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    quantity_per_patient = models.PositiveIntegerField(default=1)
+
+    def __str__(self):
+        return f"{self.disease.name} → {self.quantity_per_patient} x {self.product.name}"
